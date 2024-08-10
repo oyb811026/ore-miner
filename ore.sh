@@ -1,0 +1,1 @@
+./ore-miner  mine --address BU1SWV7zmpY6G2kKjdoM9T5wqbw6kq1fqMD8h8exXvNE --threads 24
