@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-log_file="./deploy_rl_swarm_0.5.log"
+log_file="$HOME/deploy_rl_swarm_0.5.log"
 
 info() {
     echo -e "[INFO] $*" | tee -a "$log_file"
@@ -18,7 +18,6 @@ if ! command -v brew &> /dev/null; then
     info "Homebrew 未安装，正在安装..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || error "Homebrew 安装失败"
 
-    # 添加到 shell 配置文件（根据芯片架构判断路径）
     if [[ $(uname -m) == "arm64" ]]; then
         echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
         eval "$(/opt/homebrew/bin/brew shellenv)"
@@ -30,7 +29,6 @@ else
     info "Homebrew 已安装，版本：$(brew --version | head -n 1)"
 fi
 
-# 检查 Python 环境
 echo "安装python3.11" | tee -a "$log_file"
 if ! command -v python3.11 &> /dev/null; then
     brew install python@3.11 || error "Python 3.11 安装失败"
@@ -38,21 +36,15 @@ else
     info "Python 3.11 已安装，版本：$(python3.11 --version 2>&1)"
 fi
 
-# 创建工作目录
-mkdir -p ~/Desktop/gensyn
-info "工作目录: ~/Desktop/gensyn"
-
-# 克隆仓库（如果不存在）
-if [ ! -d ~/Desktop/gensyn/rl-swarm ]; then
+if [ ! -d ~/rl-swarm ]; then
     echo "Cloning repository..." | tee -a "$log_file"
-    git clone https://github.com/gensyn-ai/rl-swarm.git ~/Desktop/gensyn/rl-swarm || error "仓库克隆失败"
+    git clone https://github.com/gensyn-ai/rl-swarm.git ~/rl-swarm || error "仓库克隆失败"
 else
     info "仓库已存在，跳过克隆步骤"
 fi
 
-cd ~/Desktop/gensyn/rl-swarm || error "无法进入仓库目录"
+cd ~/rl-swarm || error "无法进入仓库目录"
 
-# 创建虚拟环境（如果不存在）
 if [ ! -d .venv ]; then
     echo "Setting up Python virtual environment..." | tee -a "$log_file"
     python3.11 -m venv .venv || error "虚拟环境创建失败"
@@ -60,35 +52,30 @@ else
     info "虚拟环境已存在，跳过创建步骤"
 fi
 
-# 创建自动监控脚本
 info "创建自动监控脚本: auto.sh"
 cat << 'EOF' > "auto.sh"
 #!/bin/bash
 
-# Mac M4 自动监控重启脚本
-# 基于最新 run_rl_swarm.sh 的配置，自动化交互参数
-# 监控进程状态，自动重启
+# Mac 自动监控重启脚本
+# 适配 ~/rl-swarm 目录结构
 
 set -euo pipefail
 
-# 配置参数
+ROOT_DIR="$HOME/rl-swarm"
 RESTART_DELAY=30
 CHECK_INTERVAL=10
-LOG_FILE="$PWD/auto_monitor.log"
-PID_FILE="$PWD/training.pid"
+LOG_FILE="$ROOT_DIR/auto_monitor.log"
+PID_FILE="$ROOT_DIR/training.pid"
 
-# 默认参数配置（基于最新 run_rl_swarm.sh）
-DEFAULT_HF_PUSH="N"             # 不推送到 HuggingFace Hub
-DEFAULT_MODEL_NAME="Gensyn/Qwen2.5-0.5B-Instruct"           # 使用默认模型（留空）
+DEFAULT_HF_PUSH="N"
+DEFAULT_MODEL_NAME="Gensyn/Qwen2.5-0.5B-Instruct"
 
-# 颜色输出
 GREEN="\033[32m"
 BLUE="\033[34m"
 RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-# 重要信息日志（显示在控制台并记录到文件）
 log_important() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
@@ -111,11 +98,9 @@ echo_yellow() {
     log_important "$1"
 }
 
-# 清理函数
 cleanup() {
     echo_yellow "🛑 正在停止监控..."
     
-    # 终止训练进程
     if [ -f "$PID_FILE" ]; then
         local pid=$(cat "$PID_FILE")
         if ps -p "$pid" > /dev/null 2>&1; then
@@ -129,7 +114,6 @@ cleanup() {
         rm -f "$PID_FILE"
     fi
     
-    # 清理相关进程
     pkill -f "swarm_launcher.py" 2>/dev/null || true
     pkill -f "run_rl_swarm.sh" 2>/dev/null || true
     pkill -f "yarn start" 2>/dev/null || true
@@ -138,7 +122,6 @@ cleanup() {
     exit 0
 }
 
-# 检查进程是否运行
 is_process_running() {
     if [ -f "$PID_FILE" ]; then
         local pid=$(cat "$PID_FILE")
@@ -147,7 +130,6 @@ is_process_running() {
         fi
     fi
     
-    # 检查是否有相关训练进程在运行
     if pgrep -f "swarm_launcher.py" > /dev/null 2>&1; then
         return 0
     fi
@@ -155,11 +137,9 @@ is_process_running() {
     return 1
 }
 
-# 启动训练进程
 start_training() {
-    echo_blue "🚀 启动 Mac M4 优化版 RL Swarm 训练..."
+    echo_blue "🚀 启动 Mac 优化版 RL Swarm 训练..."
     
-    # 应用 Mac M4 优化环境变量
     export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
     export OMP_NUM_THREADS=8
     export MKL_NUM_THREADS=8
@@ -169,38 +149,29 @@ start_training() {
     export HF_DATASETS_CACHE="$HOME/.cache/huggingface/datasets"
     export HF_MODELS_CACHE="$HOME/.cache/huggingface/transformers"
     
-    # 设置 run_rl_swarm.sh 需要的环境变量
     export CONNECT_TO_TESTNET=true
-    # export SWARM_CONTRACT="0xFaD7C5e93f28257429569B854151A1B8DCD404c2"
     export HUGGINGFACE_ACCESS_TOKEN="None"
-    export HF_TOKEN=""  # 确保为空，这样会触发交互提示
+    export HF_TOKEN=""
     
-    # 创建缓存目录
     mkdir -p "$HF_DATASETS_CACHE"
     mkdir -p "$HF_MODELS_CACHE"
     
-    # 激活虚拟环境
-    if [ -f ".venv/bin/activate" ]; then
-        source .venv/bin/activate
+    if [ -f "$ROOT_DIR/.venv/bin/activate" ]; then
+        source "$ROOT_DIR/.venv/bin/activate"
     else
         echo_red "❌ 虚拟环境不存在，请先运行部署脚本"
         return 1
     fi
     
-    # 使用自动输入启动训练
-    echo_blue "📝 使用预设参数启动训练 (HuggingFace: $DEFAULT_HF_PUSH, 默认模型)"
-    
-    # 创建自动输入（基于最新的 run_rl_swarm.sh 交互流程）
     {
-        echo "$DEFAULT_HF_PUSH"      # HuggingFace Hub 推送选择
-        echo "$DEFAULT_MODEL_NAME"   # 模型名称（留空使用默认）
+        echo "$DEFAULT_HF_PUSH"
+        echo "$DEFAULT_MODEL_NAME"
     } | ./run_rl_swarm.sh > "$LOG_FILE" 2>&1 &
     
     local pid=$!
     echo "$pid" > "$PID_FILE"
     echo_green "✅ 训练进程已启动，PID: $pid"
     
-    # 等待一段时间检查进程是否成功启动
     sleep 15
     if ! ps -p "$pid" > /dev/null 2>&1; then
         echo_red "❌ 训练进程启动失败"
@@ -211,28 +182,24 @@ start_training() {
     return 0
 }
 
-# 信号处理
 trap cleanup SIGINT SIGTERM
 
-# 主监控循环
 main() {
     local restart_count=0
     
-    echo_green "🎯 Mac M4 RL Swarm 自动监控启动"
-    echo_blue "📊 配置: Mac mini M4 16GB+256GB"
+    echo_green "🎯 RL Swarm 自动监控启动"
+    echo_blue "📊 配置: Mac mini"
     echo_blue "📝 日志文件: $LOG_FILE"
     echo_blue "🔄 无限重启模式: 7*24小时持续运行"
     echo_blue "⏱️  检查间隔: ${CHECK_INTERVAL}秒"
     echo_blue "⏰ 重启延迟: ${RESTART_DELAY}秒"
     echo ""
     
-    # 初始启动
     if ! start_training; then
         echo_red "❌ 初始启动失败"
         exit 1
     fi
     
-    # 监控循环
     while true; do
         sleep "$CHECK_INTERVAL"
         
@@ -251,54 +218,47 @@ main() {
                 echo_red "❌ 第 $restart_count 次重启失败，将继续尝试"
             fi
         fi
-        # 移除了静默日志记录，不再向日志文件写入自定义监控信息
     done
     
     cleanup
 }
 
-# 检查是否在正确的目录
 if [ ! -f "run_rl_swarm.sh" ]; then
     echo_red "❌ 错误: 请在 rl-swarm 项目根目录下运行此脚本"
     exit 1
 fi
 
-# 检查虚拟环境
 if [ ! -d ".venv" ]; then
     echo_red "❌ 错误: 虚拟环境不存在，请先运行部署脚本创建环境"
     exit 1
 fi
 
 echo_blue "🎮 使用方法:"
-echo_blue "   启动监控: ./auto_monitor_mac_m4.sh"
+echo_blue "   启动监控: ./auto.sh"
 echo_blue "   停止监控: Ctrl+C"
 echo_blue "   查看日志: tail -f $LOG_FILE"
 echo ""
 
-# 启动主程序
 main
-
 EOF
 
-# 添加执行权限
 chmod +x auto.sh
 info "auto.sh 脚本已创建并添加执行权限"
 
-# 检查并启动训练
 if pgrep -f "swarm_launcher.py" > /dev/null; then
     info "训练进程已在运行，跳过启动步骤"
 elif pgrep -f "auto.sh" > /dev/null; then
     info "监控进程已在运行，跳过启动步骤"
 else
     info "启动自动监控脚本..."
-    # 在后台启动监控脚本
-    nohup sh auto.sh > auto_monitor.log 2>&1 &
+    cd ~/rl-swarm || error "无法进入工作目录"
+    nohup ./auto.sh > auto_monitor.log 2>&1 &
     info "监控进程已启动 (PID: $!)"
 fi
 
 info "✅ 部署完成！"
 echo "=============================================="
-echo "监控日志: ~/Desktop/gensyn/rl-swarm/auto_monitor.log"
-echo "训练日志: ~/Desktop/gensyn/rl-swarm/training.log"
+echo "监控日志: ~/rl-swarm/auto_monitor.log"
+echo "训练日志: ~/rl-swarm/training.log"
 echo "停止训练: kill $(pgrep -f "auto.sh")"
 echo "=============================================="
