@@ -77,8 +77,17 @@ check_screen() {
 setup_screen() {
     log_info "设置Screen会话: $SCREEN_NAME"
     
-    # 检查是否有多个screen会话，如果有则清理
-    local session_count=$(screen -list | grep -c "$SCREEN_NAME" || echo "0")
+    # 修复Mac兼容性问题：检查会话数量
+    local session_count=$(screen -list 2>/dev/null | grep -c "$SCREEN_NAME" || echo "0")
+    session_count=$(echo "$session_count" | tr -d '[:space:]')  # 移除空格
+    
+    if ! [[ "$session_count" =~ ^[0-9]+$ ]]; then
+        log_warn "检测会话数量失败，重置为0"
+        session_count=0
+    fi
+    
+    log_debug "检测到 $session_count 个screen会话"
+    
     if [ "$session_count" -gt 1 ]; then
         log_warn "检测到多个screen会话，清理重复会话..."
         screen -ls | grep "$SCREEN_NAME" | awk '{print $1}' | while read session; do
@@ -94,15 +103,17 @@ backup_auth_files() {
     log_info "备份认证文件..."
     mkdir -p "$HOME/backup"
     
-    if [ -f "$HOME/rl-swarm/modal-login/temp-data/userApiKey.json" ]; then
-        cp "$HOME/rl-swarm/modal-login/temp-data/userApiKey.json" "$HOME/backup/"
+    local auth_path="$HOME/rl-swarm/modal-login/temp-data"
+    
+    if [ -f "$auth_path/userApiKey.json" ]; then
+        cp "$auth_path/userApiKey.json" "$HOME/backup/"
         log_info "已备份 userApiKey.json"
     else
         log_warn "userApiKey.json 不存在，跳过备份"
     fi
     
-    if [ -f "$HOME/rl-swarm/modal-login/temp-data/userData.json" ]; then
-        cp "$HOME/rl-swarm/modal-login/temp-data/userData.json" "$HOME/backup/"
+    if [ -f "$auth_path/userData.json" ]; then
+        cp "$auth_path/userData.json" "$HOME/backup/"
         log_info "已备份 userData.json"
     else
         log_warn "userData.json 不存在，跳过备份"
@@ -112,15 +123,16 @@ backup_auth_files() {
 # 恢复认证文件
 restore_auth_files() {
     log_info "恢复认证文件..."
-    mkdir -p "$HOME/rl-swarm/modal-login/temp-data"
+    local auth_path="$HOME/rl-swarm/modal-login/temp-data"
+    mkdir -p "$auth_path"
     
     if [ -f "$HOME/backup/userApiKey.json" ]; then
-        cp "$HOME/backup/userApiKey.json" "$HOME/rl-swarm/modal-login/temp-data/"
+        cp "$HOME/backup/userApiKey.json" "$auth_path/"
         log_info "已恢复 userApiKey.json"
     fi
     
     if [ -f "$HOME/backup/userData.json" ]; then
-        cp "$HOME/backup/userData.json" "$HOME/rl-swarm/modal-login/temp-data/"
+        cp "$HOME/backup/userData.json" "$auth_path/"
         log_info "已恢复 userData.json"
     fi
 }
@@ -192,10 +204,8 @@ monitor_rl_swarm() {
                 log_info "清理过大的日志文件..."
                 echo "" > "$LOG_FILE"
             fi
-        fi
-        
-        # 监控日志文件
-        if [ -f "$LOG_FILE" ]; then
+            
+            # 监控日志文件
             tail -n 50 "$LOG_FILE" | while read line; do
                 # 简化日志处理（移除颜色代码处理）
                 clean_line=$(echo "$line" | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\r//g')
