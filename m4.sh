@@ -205,7 +205,7 @@ if [ ! -d ".venv" ]; then
 fi
 
 echo_blue "🎮 使用方法:"
-echo_blue "   启动监控: ./auto_monitor_mac_m4.sh"
+echo_blue "   启动监控: ./m4.sh"
 echo_blue "   停止监控: Ctrl+C"
 echo_blue "   查看日志: tail -f $LOG_FILE"
 echo ""
