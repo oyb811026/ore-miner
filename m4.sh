@@ -1,228 +1,377 @@
 #!/bin/bash
 
-# RL Swarm M4 终极兼容版
-# 版本: 4.3
-# 特点: 
-# - 100% 兼容 macOS 原生 Bash 3.2
-# - 完美支持 M4 芯片 Metal 加速
-# - 智能资源管理
-# - 自动错误恢复
+# RL Swarm 自动重启脚本（Mac M系列优化版）
+# 使用方法: ./screen_auto_restart.sh
 
-set -eo pipefail
+set -euo pipefail
 
-# ================= 基础配置 =================
-# 颜色代码 (兼容旧版Bash)
-COLOR_RED="\033[31m"
-COLOR_GREEN="\033[32m"
-COLOR_YELLOW="\033[33m"
-COLOR_BLUE="\033[34m"
-COLOR_MAGENTA="\033[35m"
-COLOR_CYAN="\033[36m"
-COLOR_RESET="\033[0m"
-COLOR_BOLD="\033[1m"
+# 颜色定义
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-# 日志函数
-log() {
-    local color="$1"
-    local prefix="$2"
-    shift 2
-    echo -e "${color}${prefix}${COLOR_RESET} $*"
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
 }
 
-log_header() { log "$COLOR_MAGENTA" "==>" "$@"; }
-log_success() { log "$COLOR_GREEN" "✓" "$@"; }
-log_warning() { log "$COLOR_YELLOW" "⚠" "$@"; }
-log_error() { log "$COLOR_RED" "✗" "$@"; }
-log_info() { log "$COLOR_BLUE" "ℹ" "$@"; }
-
-# ================= M4 专属配置 =================
-# 硬件配置 (使用普通变量替代关联数组)
-M4_TOTAL_MEM="16"        # 单位GB
-M4_ALLOC_MEM="12"        # 单位GB
-M4_CPU_CORES="6"         # 使用核心数
-M4_MODEL="Qwen2.5-0.5B"  # 默认模型
-M4_CACHE_DIR="/tmp/m4_swarm_cache"
-
-# ================= 环境初始化 =================
-init_m4_environment() {
-    log_header "正在初始化 M4 环境"
-    
-    # 验证Apple Silicon
-    local cpu_brand=$(sysctl -n machdep.cpu.brand_string)
-    if [[ "$cpu_brand" != *"Apple M4"* ]]; then
-        log_warning "非M4芯片检测到: $cpu_brand"
-    fi
-
-    # Metal加速检测
-    if ! system_profiler SPDisplaysDataType | grep -q "Metal Support"; then
-        log_warning "Metal加速不可用，将使用CPU模式"
-        export PYTORCH_ENABLE_MPS_FALLBACK=0
-    else
-        log_success "检测到Metal GPU加速支持"
-        export PYTORCH_ENABLE_MPS_FALLBACK=1
-    fi
-
-    # 内存配置
-    local system_mem=$(($(sysctl -n hw.memsize) / 1024 / 1024 / 1024))
-    if (( system_mem < M4_TOTAL_MEM )); then
-        log_warning "检测到${system_mem}GB内存，低于配置值${M4_TOTAL_MEM}GB"
-        M4_ALLOC_MEM=$((system_mem - 4))
-    fi
-    
-    export MPS_GRAPH_CACHE_MEMORY_LIMIT="${M4_ALLOC_MEM}G"
-    export OMP_NUM_THREADS="$M4_CPU_CORES"
-    
-    # 创建缓存目录
-    mkdir -p "$M4_CACHE_DIR"
-    export HF_HOME="$M4_CACHE_DIR"
-    
-    log_info "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔"
-    log_info "  分配内存: ${M4_ALLOC_MEM}GB"
-    log_info "  CPU线程: $M4_CPU_CORES"
-    log_info "  使用模型: $M4_MODEL"
-    log_info "  缓存目录: $M4_CACHE_DIR"
-    log_info "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔"
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
-# ================= 训练管理 =================
-start_training() {
-    log_header "正在启动训练任务"
-    
-    # 内存检查
-    local free_mem=$(vm_stat | grep "Pages free" | awk '{print $3}' | tr -d '.')
-    free_mem=$((free_mem * 4096 / 1024 / 1024))  # 转换为MB
-    
-    if (( free_mem < 2000 )); then
-        log_warning "可用内存不足 (${free_mem}MB)，正在清理..."
-        purge
-    fi
-
-    # 启动命令序列
-    local commands=(
-        "source .venv/bin/activate"
-        "export PYTHONUNBUFFERED=1"
-        "python -c \"import torch; print(f'\\n${COLOR_MAGENTA}PyTorch 后端: {torch.backends.mps.is_available() and 'Metal' or 'CPU'}${COLOR_RESET}\\n')\""
-        "./run_rl_swarm.sh"
-    )
-
-    # 创建screen会话
-    if ! screen -list | grep -q "rl_swarm"; then
-        screen -dmS rl_swarm
-        sleep 1
-    fi
-
-    # 发送命令
-    for cmd in "${commands[@]}"; do
-        screen -S rl_swarm -X stuff "$cmd$(printf '\r')"
-        sleep 1
-    done
-
-    log_success "训练任务已成功启动"
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
 }
 
-monitor_training() {
-    log_header "正在启动监控系统"
-    local log_file="/tmp/rl_swarm_$(date +%Y%m%d).log"
-    local last_round=0
-    local error_count=0
-    
-    # 设置日志记录
-    screen -S rl_swarm -X logfile "$log_file"
-    screen -S rl_swarm -X log on
+log_debug() {
+    echo -e "${BLUE}[DEBUG]${NC} $1"
+}
 
-    # 日志跟踪 (兼容旧版tail)
-    tail -F "$log_file" | while read -r line; do
-        # Round进度检测
-        if [[ "$line" =~ "Starting round: "([0-9]+) ]]; then
-            local current_round="${BASH_REMATCH[1]}"
-            if (( current_round > last_round + 1 )); then
-                log_warning "检测到Round跳跃: $last_round → $current_round"
-            fi
-            last_round="$current_round"
-            error_count=0
-        
-        # GPU内存处理
-        elif [[ "$line" == *"MPS backend out of memory"* ]]; then
-            log_warning "GPU内存不足，正在清理缓存..."
-            python -c "import torch; torch.mps.empty_cache()"
-        
-        # 错误处理
-        elif [[ "$line" == *"ERROR"* || "$line" == *"Exception"* ]]; then
-            ((error_count++))
-            if (( error_count > 3 )); then
-                log_error "检测到连续错误，需要重启"
-                return 1
-            fi
-        
-        # 启动成功检测
-        elif [[ "$line" == *"Good luck in the swarm!"* ]]; then
-            log_success "训练正常初始化完成"
+# Screen会话名称
+SCREEN_NAME="gensyn"
+
+# PID文件路径
+PID_FILE="/tmp/rl_swarm_daemon.pid"
+
+# 检查是否已有实例运行
+check_existing_instance() {
+    if [ -f "$PID_FILE" ]; then
+        local existing_pid=$(cat "$PID_FILE")
+        if ps -p "$existing_pid" > /dev/null; then
+            log_warn "检测到已有实例运行 (PID: $existing_pid)"
+            log_info "如需启动新实例，请先停止旧实例：$0 --stop"
+            return 1
+        else
+            log_info "清理过期的PID文件"
+            rm -f "$PID_FILE"
         fi
-    done
+    fi
+    return 0
 }
 
-restart_training() {
-    log_header "正在重启训练服务"
-    
-    # 清理现有进程
-    pkill -f "run_rl_swarm.sh" || true
-    screen -S rl_swarm -X quit || true
-    python -c "import torch; torch.mps.empty_cache()" 2>/dev/null || true
-    
-    # 等待资源释放
-    sleep 5
-    
-    # 重新启动
-    init_m4_environment
-    start_training
+# 创建PID文件
+create_pid_file() {
+    echo $$ > "$PID_FILE"
+    log_info "创建PID文件: $PID_FILE (PID: $$)"
 }
 
-# ================= 主控制流 =================
-main_loop() {
-    while true; do
-        start_training
-        
-        if ! monitor_training; then
-            log_warning "训练异常，将在10秒后重启..."
-            sleep 10
-            restart_training
-        fi
-        
-        sleep 5
-    done
+# 清理PID文件
+cleanup_pid_file() {
+    if [ -f "$PID_FILE" ]; then
+        rm -f "$PID_FILE"
+        log_info "清理PID文件: $PID_FILE"
+    fi
 }
 
-# ================= 命令行接口 =================
-case "$1" in
-    start|--start)
-        init_m4_environment
-        main_loop
-        ;;
-    stop|--stop)
-        pkill -f "run_rl_swarm.sh"
-        screen -S rl_swarm -X quit
-        log_success "已停止所有训练服务"
-        ;;
-    status|--status)
-        echo -e "${COLOR_CYAN}=== 训练服务状态 ===${COLOR_RESET}"
-        echo -e "${COLOR_BOLD}Screen会话:${COLOR_RESET}"
-        screen -list | grep "rl_swarm" || echo "未运行"
-        echo -e "\n${COLOR_BOLD}训练进程:${COLOR_RESET}"
-        pgrep -fl "run_rl_swarm.sh" || echo "未运行"
-        echo -e "\n${COLOR_BOLD}PyTorch后端:${COLOR_RESET}"
-        python -c "import torch; print('Metal' if torch.backends.mps.is_available() else 'CPU')"
-        ;;
-    clean|--clean)
-        rm -rf "$M4_CACHE_DIR"
-        python -c "import torch; torch.mps.empty_cache()"
-        log_success "已清理所有缓存"
-        ;;
-    *)
-        echo -e "${COLOR_BOLD}使用方法:${COLOR_RESET}"
-        echo "  $0 start    启动训练服务"
-        echo "  $0 stop     停止服务"
-        echo "  $0 status   查看状态"
-        echo "  $0 clean    清理缓存"
+# 检查screen是否安装
+check_screen() {
+    if ! command -v screen &> /dev/null; then
+        log_error "screen未安装，请使用以下命令安装："
+        log_error "brew install screen"
         exit 1
-        ;;
-esac
+    fi
+}
+
+# 创建或连接到screen会话
+setup_screen() {
+    log_info "设置Screen会话: $SCREEN_NAME"
+    
+    # 检查是否有多个screen会话，如果有则清理
+    local session_count=$(screen -list | grep -c "$SCREEN_NAME" || echo "0")
+    if [ "$session_count" -gt 1 ]; then
+        log_warn "检测到多个screen会话，清理重复会话..."
+        screen -ls | grep "$SCREEN_NAME" | awk '{print $1}' | while read session; do
+            log_info "删除重复的screen会话: $session"
+            screen -S "$session" -X quit 2>/dev/null || true
+        done
+        sleep 2
+    fi
+}
+
+# 备份认证文件
+backup_auth_files() {
+    log_info "备份认证文件..."
+    mkdir -p "$HOME/backup"
+    
+    if [ -f "$HOME/rl-swarm/modal-login/temp-data/userApiKey.json" ]; then
+        cp "$HOME/rl-swarm/modal-login/temp-data/userApiKey.json" "$HOME/backup/"
+        log_info "已备份 userApiKey.json"
+    else
+        log_warn "userApiKey.json 不存在，跳过备份"
+    fi
+    
+    if [ -f "$HOME/rl-swarm/modal-login/temp-data/userData.json" ]; then
+        cp "$HOME/rl-swarm/modal-login/temp-data/userData.json" "$HOME/backup/"
+        log_info "已备份 userData.json"
+    else
+        log_warn "userData.json 不存在，跳过备份"
+    fi
+}
+
+# 恢复认证文件
+restore_auth_files() {
+    log_info "恢复认证文件..."
+    mkdir -p "$HOME/rl-swarm/modal-login/temp-data"
+    
+    if [ -f "$HOME/backup/userApiKey.json" ]; then
+        cp "$HOME/backup/userApiKey.json" "$HOME/rl-swarm/modal-login/temp-data/"
+        log_info "已恢复 userApiKey.json"
+    fi
+    
+    if [ -f "$HOME/backup/userData.json" ]; then
+        cp "$HOME/backup/userData.json" "$HOME/rl-swarm/modal-login/temp-data/"
+        log_info "已恢复 userData.json"
+    fi
+}
+
+# 启动或重启RL Swarm
+start_or_restart_rl_swarm() {
+    local is_restart=${1:-false}
+    
+    if [ "$is_restart" = true ]; then
+        log_info "重启RL Swarm..."
+        
+        # 删除所有旧的screen会话
+        log_info "删除所有旧的screen会话..."
+        screen -ls | grep "$SCREEN_NAME" | awk '{print $1}' | while read session; do
+            log_info "删除screen会话: $session"
+            screen -S "$session" -X quit 2>/dev/null || true
+        done
+        sleep 3
+    else
+        log_info "启动RL Swarm..."
+    fi
+    
+    # 恢复认证文件
+    restore_auth_files
+    
+    # 创建新的screen会话
+    log_info "创建新的screen会话..."
+    screen -dmS "$SCREEN_NAME" bash -c "cd $HOME && exec bash"
+    sleep 2
+    
+    # 在screen会话中启动RL Swarm
+    log_info "在screen会话中启动RL Swarm..."
+    screen -S "$SCREEN_NAME" -X stuff "cd $HOME/rl-swarm$(printf '\r')"
+    sleep 1
+    screen -S "$SCREEN_NAME" -X stuff "source .venv/bin/activate$(printf '\r')"
+    sleep 1
+    screen -S "$SCREEN_NAME" -X stuff "./run_rl_swarm.sh$(printf '\r')"
+    
+    log_info "RL Swarm已在screen会话中启动"
+    
+    # 启动日志捕获
+    log_info "启动日志捕获..."
+    LOG_FILE="/tmp/rl_swarm_screen.log"
+    screen -S "$SCREEN_NAME" -X logfile "$LOG_FILE"
+    screen -S "$SCREEN_NAME" -X log on
+    sleep 2
+    
+    # 开始监控
+    monitor_rl_swarm
+}
+
+# 监控RL Swarm输出
+monitor_rl_swarm() {
+    log_info "开始监控RL Swarm输出..."
+    
+    # 初始化状态变量
+    startup_complete=false
+    auth_handled=false
+    startup_start_time=$(date +%s)
+    
+    while true; do
+        # 日志文件路径
+        LOG_FILE="/tmp/rl_swarm_screen.log"
+        
+        # 检查日志文件大小（Mac兼容方式）
+        if [ -f "$LOG_FILE" ]; then
+            log_size=$(wc -c < "$LOG_FILE" | awk '{print $1}')
+            if [ $log_size -gt 10485760 ]; then  # 10MB
+                log_info "清理过大的日志文件..."
+                echo "" > "$LOG_FILE"
+            fi
+        fi
+        
+        # 监控日志文件
+        if [ -f "$LOG_FILE" ]; then
+            tail -n 50 "$LOG_FILE" | while read line; do
+                # 简化日志处理（移除颜色代码处理）
+                clean_line=$(echo "$line" | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\r//g')
+                
+                if [ -n "$clean_line" ]; then
+                    # 检测启动完成标志
+                    if echo "$clean_line" | grep -q "Good luck in the swarm!"; then
+                        startup_complete=true
+                        log_info "RL Swarm启动完成"
+                    fi
+                    
+                    # 检测异常错误
+                    if echo "$clean_line" | grep -E "(ERROR: Exception occurred during game run\.|Traceback \(most recent call last\):|Segmentation fault)"; then
+                        log_warn "检测到严重错误，准备重启..."
+                        sleep 10
+                        start_or_restart_rl_swarm true
+                        return
+                    fi
+                    
+                    # 检测认证提示
+                    if [ "$auth_handled" = false ]; then
+                        if echo "$clean_line" | grep -q "Waiting for modal userData.json to be created"; then
+                            log_info "检测到认证提示，恢复备份文件..."
+                            restore_auth_files
+                            auth_handled=true
+                            sleep 2
+                            screen -S "$SCREEN_NAME" -X stuff "N$(printf '\r')"
+                            sleep 1
+                            screen -S "$SCREEN_NAME" -X stuff "Gensyn/Qwen2.5-0.5B-Instruct$(printf '\r')"
+                        fi
+                    fi
+                fi
+            done
+        fi
+        
+        # 检查进程状态
+        if ! pgrep -f "run_rl_swarm.sh" > /dev/null; then
+            log_warn "RL Swarm进程已停止，准备重启..."
+            start_or_restart_rl_swarm true
+            sleep 10
+            continue
+        fi
+        
+        # 检查screen会话状态
+        if ! screen -list | grep -q "$SCREEN_NAME"; then
+            log_warn "Screen会话丢失，准备重启..."
+            start_or_restart_rl_swarm true
+            sleep 10
+            continue
+        fi
+        
+        # 简单心跳检测
+        sleep 30
+        log_info "监控运行中..."
+    done
+}
+
+# 清理临时文件
+cleanup() {
+    log_info "清理临时文件..."
+    rm -f /tmp/rl_swarm_screen.log
+    rm -f /tmp/rl_swarm_daemon.log
+    cleanup_pid_file
+}
+
+# 显示帮助信息
+show_help() {
+    echo "RL Swarm 自动重启脚本（Mac优化版）"
+    echo ""
+    echo "使用方法:"
+    echo "  $0                    # 前台启动"
+    echo "  $0 --daemon          # 后台启动"
+    echo "  $0 --help            # 显示帮助"
+    echo "  $0 --status          # 显示状态"
+    echo "  $0 --stop            # 停止脚本"
+    echo ""
+    echo "Screen管理命令:"
+    echo "  screen -r $SCREEN_NAME    # 连接会话"
+    echo "  screen -list              # 查看会话"
+}
+
+# 显示状态
+show_status() {
+    echo "=== RL Swarm 状态 ==="
+    
+    # 后台进程状态
+    if [ -f "$PID_FILE" ]; then
+        local daemon_pid=$(cat "$PID_FILE")
+        if ps -p "$daemon_pid" > /dev/null; then
+            echo "监控进程: 运行中 (PID: $daemon_pid)"
+        else
+            echo "监控进程: 未运行"
+        fi
+    else
+        echo "监控进程: 未运行"
+    fi
+    
+    # Screen会话状态
+    echo -n "Screen会话: "
+    if screen -list | grep -q "$SCREEN_NAME"; then
+        echo "运行中"
+    else
+        echo "未运行"
+    fi
+    
+    # RL Swarm进程状态
+    echo -n "RL Swarm进程: "
+    if pgrep -f "run_rl_swarm.sh" > /dev/null; then
+        echo "运行中"
+    else
+        echo "未运行"
+    fi
+}
+
+# 主函数
+main() {
+    case "${1:-}" in
+        --help)
+            show_help
+            exit 0
+            ;;
+        --status)
+            show_status
+            exit 0
+            ;;
+        --stop)
+            log_info "停止RL Swarm..."
+            # 停止监控进程
+            if [ -f "$PID_FILE" ]; then
+                local daemon_pid=$(cat "$PID_FILE")
+                if ps -p "$daemon_pid" > /dev/null; then
+                    kill "$daemon_pid" 2>/dev/null && log_info "监控进程已停止"
+                fi
+            fi
+            
+            # 停止screen会话
+            screen -ls | grep "$SCREEN_NAME" | awk '{print $1}' | while read session; do
+                screen -S "$session" -X quit 2>/dev/null && log_info "Screen会话已停止"
+            done
+            
+            cleanup_pid_file
+            exit 0
+            ;;
+        --daemon)
+            log_info "启动后台监控模式..."
+            nohup "$0" > /tmp/rl_swarm_daemon.log 2>&1 &
+            log_info "后台进程PID: $!"
+            exit 0
+            ;;
+    esac
+    
+    log_info "启动RL Swarm自动重启脚本（Mac优化版）..."
+    
+    # 检查现有实例
+    if ! check_existing_instance; then
+        exit 1
+    fi
+    
+    # 创建PID文件
+    create_pid_file
+    
+    # 检查依赖
+    check_screen
+    
+    # 备份文件
+    backup_auth_files
+    
+    # 设置screen
+    setup_screen
+    
+    # 设置退出清理
+    trap 'log_info "退出清理..."; cleanup; exit 0' SIGTERM SIGINT
+    
+    # 启动RL Swarm
+    start_or_restart_rl_swarm
+}
+
+# 运行主函数
+main "$@"
