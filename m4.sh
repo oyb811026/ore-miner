@@ -1,234 +1,265 @@
 #!/bin/bash
 
-# M4芯片专用监控脚本（Apple Silicon优化版）
-# 动态资源分配｜自动模型选择｜智能重启监控
-# 最后更新: 2025年7月
+# RL Swarm M4 专属管理脚本
+# 版本: 4.1
+# 适配硬件: Apple M4芯片 + 16GB内存
+# 功能: 自动重启 | Metal加速 | 智能资源管理
 
-set -euo pipefail
+set -eo pipefail
 
-# 配置参数
-RESTART_DELAY=30
-CHECK_INTERVAL=10
-LOG_FILE="$PWD/m4_monitor.log"
-PID_FILE="$PWD/training.pid"
+# ██████╗ ██████╗  █████╗ ███████╗
+# ██╔══██╗██╔══██╗██╔══██╗██╔════╝
+# ██████╔╝██████╔╝███████║███████╗
+# ██╔═══╝ ██╔══██╗██╔══██║╚════██║
+# ██║     ██║  ██║██║  ██║███████║
+# ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝
 
-# 默认参数
-DEFAULT_HF_PUSH="N"
-DEFAULT_MODEL_NAME="Gensyn/Qwen2.5-0.5B-Instruct"
-
-# 颜色输出
-GREEN="\033[32m"
-BLUE="\033[34m"
+# 颜色定义
+BOLD="\033[1m"
 RED="\033[31m"
+GREEN="\033[32m"
 YELLOW="\033[33m"
+BLUE="\033[34m"
+MAGENTA="\033[35m"
+CYAN="\033[36m"
 RESET="\033[0m"
 
-# 日志系统
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
-}
+# 日志函数
+log_header() { echo -e "${BOLD}${MAGENTA}==>${RESET} ${BOLD}$1${RESET}"; }
+log_success() { echo -e "${GREEN}✓${RESET} $1"; }
+log_warning() { echo -e "${YELLOW}⚠${RESET} $1"; }
+log_error() { echo -e "${RED}✗${RESET} $1"; }
+log_info() { echo -e "${BLUE}ℹ${RESET} $1"; }
+log_debug() { echo -e "${CYAN}⚙${RESET} $1"; }
 
-echo_green() {
-    echo -e "${GREEN}$1${RESET}" | tee -a "$LOG_FILE"
-}
+# ███╗   ███╗ █████╗  ██████╗██████╗  ██████╗
+# ████╗ ████║██╔══██╗██╔════╝██╔══██╗██╔═══██╗
+# ██╔████╔██║███████║██║     ██████╔╝██║   ██║
+# ██║╚██╔╝██║██╔══██║██║     ██╔══██╗██║   ██║
+# ██║ ╚═╝ ██║██║  ██║╚██████╗██║  ██║╚██████╔╝
+# ╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝
 
-echo_blue() {
-    echo -e "${BLUE}$1${RESET}" | tee -a "$LOG_FILE"
-}
+# M4 硬件配置
+declare -A M4_CONFIG=(
+    [TOTAL_MEM]="16G"            # 物理内存
+    [ALLOC_MEM]="12G"            # 分配给训练任务
+    [CPU_CORES]="6"              # 使用核心数 (4性能+2能效)
+    [GPU_BACKEND]="metal"        # 加速后端
+    [MODEL]="Qwen2.5-0.5B"       # 默认模型
+    [CACHE_DIR]="/tmp/m4_cache"  # 缓存位置
+)
 
-echo_red() {
-    echo -e "${RED}$1${RESET}" | tee -a "$LOG_FILE"
-}
+# ███████╗██╗   ██╗███╗   ██╗ ██████╗████████╗██╗ ██████╗ ███╗   ██╗
+# ██╔════╝██║   ██║████╗  ██║██╔════╝╚══██╔══╝██║██╔═══██╗████╗  ██║
+# █████╗  ██║   ██║██╔██╗ ██║██║        ██║   ██║██║   ██║██╔██╗ ██║
+# ██╔══╝  ██║   ██║██║╚██╗██║██║        ██║   ██║██║   ██║██║╚██╗██║
+# ██║     ╚██████╔╝██║ ╚████║╚██████╗   ██║   ██║╚██████╔╝██║ ╚████║
+# ╚═╝      ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝
 
-echo_yellow() {
-    echo -e "${YELLOW}$1${RESET}" | tee -a "$LOG_FILE"
-}
-
-# 清理函数
-cleanup() {
-    echo_yellow "🛑 停止监控中..."
+init_m4_environment() {
+    log_header "初始化 M4 环境"
     
-    if [ -f "$PID_FILE" ]; then
-        local pid=$(cat "$PID_FILE")
-        if ps -p "$pid" > /dev/null 2>&1; then
-            echo_yellow "终止训练进程 PID: $pid"
-            kill -TERM "$pid" 2>/dev/null || true
-            sleep 3
-            if ps -p "$pid" > /dev/null 2>&1; then
-                kill -KILL "$pid" 2>/dev/null || true
-            fi
-        fi
-        rm -f "$PID_FILE"
-    fi
-    
-    pkill -f "swarm_launcher.py" 2>/dev/null || true
-    pkill -f "run_rl_swarm.sh" 2>/dev/null || true
-    
-    echo_green "✅ 监控已停止"
-    exit 0
-}
-
-# 进程检查
-is_process_running() {
-    if [ -f "$PID_FILE" ]; then
-        local pid=$(cat "$PID_FILE")
-        ps -p "$pid" > /dev/null 2>&1 && return 0
-    fi
-    
-    pgrep -f "swarm_launcher.py" > /dev/null 2>&1 && return 0
-    return 1
-}
-
-# 启动训练
-start_training() {
-    # ================= 动态资源优化 =================
-    # 内存配置
-    TOTAL_MEM=$(($(sysctl -n hw.memsize) / 1024 / 1024))  # MB
-    USABLE_MEM=$((TOTAL_MEM * 75 / 100))
-    export MPS_GRAPH_CACHE_MEMORY_LIMIT="${USABLE_MEM}M"
-    
-    # CPU线程优化
-    CPU_CORES=$(sysctl -n hw.ncpu)
-    OPTIMAL_THREADS=$((CPU_CORES > 8 ? 8 : CPU_CORES - 1))
-    [ $OPTIMAL_THREADS -lt 1 ] && OPTIMAL_THREADS=1
-    export OMP_NUM_THREADS=$OPTIMAL_THREADS
-    export MKL_NUM_THREADS=$OPTIMAL_THREADS
-    
-    # GPU加速配置
-    if [ "$(uname -m)" = "arm64" ]; then
-        echo_blue "✅ Apple Silicon芯片：启用GPU加速"
-        unset CPU_ONLY
-        export PYTORCH_ENABLE_MPS_FALLBACK=0
-        
-        # 智能模型选择
-        if [ $TOTAL_MEM -ge 32000 ]; then  # 32GB+
-            DEFAULT_MODEL_NAME="Gensyn/Qwen2.5-1.5B-Instruct"
-            echo_blue "💾 检测到大内存(>32GB)，自动升级到1.5B模型"
-        elif [ $TOTAL_MEM -ge 16000 ]; then  # 16GB
-            DEFAULT_MODEL_NAME="Gensyn/Qwen2.5-0.5B-Instruct"
-        else
-            echo_yellow "⚠️  内存不足16GB，建议升级硬件"
-        fi
-    else
-        echo_yellow "⚠️  非Apple Silicon芯片，使用CPU模式"
-        export CPU_ONLY=1
-    fi
-    # ================= 优化结束 =================
-    
-    echo_blue "🚀 启动RL Swarm训练..."
-    echo_blue "🧠 内存: ${TOTAL_MEM}MB (分配${USABLE_MEM}MB)"
-    echo_blue "⚙️  线程: ${OPTIMAL_THREADS}核"
-    echo_blue "🤖 模型: ${DEFAULT_MODEL_NAME}"
-    
-    # 环境变量
-    export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
-    export HF_HUB_DOWNLOAD_TIMEOUT=300
-    export CONNECT_TO_TESTNET=true
-    export SWARM_CONTRACT="0xFaD7C5e93f28257429569B854151A1B8DCD404c2"
-    export HUGGINGFACE_ACCESS_TOKEN="None"
-    export HF_TOKEN=""
-    
-    # 缓存目录
-    export HF_DATASETS_CACHE="$HOME/.cache/huggingface/datasets"
-    export HF_MODELS_CACHE="$HOME/.cache/huggingface/transformers"
-    mkdir -p "$HF_DATASETS_CACHE"
-    mkdir -p "$HF_MODELS_CACHE"
-    
-    # 激活虚拟环境
-    if [ -f ".venv/bin/activate" ]; then
-        source .venv/bin/activate
-    else
-        echo_red "❌ 虚拟环境不存在"
-        return 1
-    fi
-    
-    # 自动启动训练
-    {
-        echo "$DEFAULT_HF_PUSH"
-        echo "$DEFAULT_MODEL_NAME"
-    } | ./run_rl_swarm.sh >> "$LOG_FILE" 2>&1 &
-    
-    local pid=$!
-    echo "$pid" > "$PID_FILE"
-    echo_green "✅ 训练已启动 PID: $pid"
-    
-    # 启动健康检查
-    sleep 25
-    if ! ps -p "$pid" > /dev/null 2>&1; then
-        echo_red "❌ 进程启动失败"
-        rm -f "$PID_FILE"
-        return 1
-    fi
-    
-    if ! grep -q "Training started" "$LOG_FILE"; then
-        echo_red "❌ 训练初始化失败，请检查日志"
-        return 1
-    fi
-    
-    return 0
-}
-
-# 信号处理
-trap cleanup SIGINT SIGTERM
-
-# 主循环
-main() {
-    local restart_count=0
-    
-    echo_green "🎯 M4监控脚本启动"
-    echo_blue "🖥️  设备: $(sysctl -n hw.model)"
-    echo_blue "💾 内存: $(sysctl -n hw.memsize | awk '{printf "%dGB", $0/1024/1024/1024}')"
-    echo_blue "🧠 CPU: $(sysctl -n hw.ncpu)核"
-    echo_blue "📝 日志: $LOG_FILE"
-    echo_blue "🔄 重启延迟: ${RESTART_DELAY}秒"
-    echo ""
-    
-    if ! start_training; then
-        echo_red "❌ 启动失败"
+    # 验证硬件
+    local cpu_family=$(sysctl -n machdep.cpu.family)
+    if [[ "$cpu_family" != "ARM64" ]]; then
+        log_error "非Apple Silicon架构"
         exit 1
     fi
+
+    # 检测Metal支持
+    if ! system_profiler SPDisplaysDataType | grep -q "Metal Support"; then
+        log_warning "Metal加速不可用，性能将受限"
+        M4_CONFIG[GPU_BACKEND]="cpu"
+    fi
+
+    # 创建缓存目录
+    mkdir -p "${M4_CONFIG[CACHE_DIR]}"
+    chmod 777 "${M4_CONFIG[CACHE_DIR]}"
+
+    # 设置环境变量
+    export PYTORCH_ENABLE_MPS_FALLBACK=1
+    export MPS_GRAPH_CACHE_MEMORY_LIMIT="${M4_CONFIG[ALLOC_MEM]}"
+    export OMP_NUM_THREADS="${M4_CONFIG[CPU_CORES]}"
+    export HF_HOME="${M4_CONFIG[CACHE_DIR]}"
+    export TORCH_USE_METAL=1
     
-    while true; do
-        sleep "$CHECK_INTERVAL"
-        
-        if ! is_process_running; then
-            echo_yellow "⚠️  进程已停止"
-            
-            restart_count=$((restart_count + 1))
-            echo_yellow "🔄 重启 #${restart_count}"
-            echo_yellow "⏳ ${RESTART_DELAY}秒后重启..."
-            
-            sleep "$RESTART_DELAY"
-            
-            if start_training; then
-                echo_green "✅ 重启成功"
-            else
-                echo_red "❌ 重启失败"
-            fi
-        fi
+    log_debug "内存分配: ${M4_CONFIG[ALLOC_MEM]}"
+    log_debug "CPU核心: ${M4_CONFIG[CPU_CORES]}"
+    log_debug "加速后端: ${M4_CONFIG[GPU_BACKEND]}"
+    log_debug "缓存目录: ${M4_CONFIG[CACHE_DIR]}"
+}
+
+# ████████╗██████╗  █████╗ ██╗███╗   ██╗██╗███╗   ██╗ ██████╗ 
+# ╚══██╔══╝██╔══██╗██╔══██╗██║████╗  ██║██║████╗  ██║██╔════╝ 
+#    ██║   ██████╔╝███████║██║██╔██╗ ██║██║██╔██╗ ██║██║  ███╗
+#    ██║   ██╔══██╗██╔══██║██║██║╚██╗██║██║██║╚██╗██║██║   ██║
+#    ██║   ██║  ██║██║  ██║██║██║ ╚████║██║██║ ╚████║╚██████╔╝
+#    ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚═╝╚═╝  ╚═══╝ ╚═════╝ 
+
+start_training() {
+    log_header "启动训练任务"
+    
+    # 资源预检查
+    local free_mem=$(vm_stat | grep "Pages free" | awk '{print $3}' | tr -d '.' | awk '{print $1*4096/1024/1024}')
+    if (( $(echo "$free_mem < 2000" | bc -l) )); then
+        log_warning "可用内存不足 (${free_mem}MB)，正在清理..."
+        purge
+    fi
+
+    # 启动命令
+    local cmd=(
+        "source .venv/bin/activate"
+        "export PYTHONUNBUFFERED=1"
+        "python -c 'import torch; print(f\"\n{MAGENTA}PyTorch 使用 {torch.backends.mps.is_available() and \"Metal\" or \"CPU\"} 加速{RESET}\n\")'"
+        "./run_rl_swarm.sh"
+    )
+
+    # 创建screen会话
+    if ! screen -list | grep -q "rl_train"; then
+        screen -dmS rl_train -t "RL Swarm"
+        sleep 1
+    fi
+
+    # 发送命令
+    for instruction in "${cmd[@]}"; do
+        screen -S rl_train -X stuff "${instruction}$(printf '\r')"
+        sleep 1
+    done
+
+    log_success "训练任务已启动"
+}
+
+# ███╗   ███╗ ██████╗ ███╗   ██╗██╗████████╗ ██████╗ ██████╗ 
+# ████╗ ████║██╔═══██╗████╗  ██║██║╚══██╔══╝██╔═══██╗██╔══██╗
+# ██╔████╔██║██║   ██║██╔██╗ ██║██║   ██║   ██║   ██║██████╔╝
+# ██║╚██╔╝██║██║   ██║██║╚██╗██║██║   ██║   ██║   ██║██╔══██╗
+# ██║ ╚═╝ ██║╚██████╔╝██║ ╚████║██║   ██║   ╚██████╔╝██║  ██║
+# ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝
+
+monitor_training() {
+    log_header "启动监控系统"
+    local log_file="/tmp/rl_swarm.log"
+    local last_round=0
+    local error_count=0
+    
+    # 开始日志跟踪
+    screen -S rl_train -X logfile "$log_file"
+    screen -S rl_train -X log on
+
+    tail -Fn0 "$log_file" | while read -r line; do
+        # 检测关键事件
+        case "$line" in
+            *"Starting round:"*)
+                current_round=$(echo "$line" | grep -oE '[0-9]+')
+                if (( current_round > last_round + 1 )); then
+                    log_warning "Round跳跃检测: $last_round → $current_round"
+                fi
+                last_round=$current_round
+                error_count=0
+                ;;
+                
+            *"MPS backend out of memory"*)
+                log_warning "GPU内存不足，自动清理缓存..."
+                python -c "import torch; torch.mps.empty_cache()"
+                ;;
+                
+            *"ERROR"*|*"Exception"*)
+                ((error_count++))
+                if (( error_count > 3 )); then
+                    log_error "检测到连续错误，准备重启..."
+                    return 1
+                fi
+                ;;
+                
+            *"Good luck in the swarm!"*)
+                log_success "训练正常启动"
+                ;;
+        esac
     done
 }
 
-# 环境检查
-if [ ! -f "run_rl_swarm.sh" ]; then
-    echo_red "❌ 错误: 请在项目目录运行"
-    exit 1
-fi
+# ██████╗ ███████╗██████╗ ██╗   ██╗
+# ██╔══██╗██╔════╝██╔══██╗╚██╗ ██╔╝
+# ██████╔╝█████╗  ██████╔╝ ╚████╔╝ 
+# ██╔══██╗██╔══╝  ██╔══██╗  ╚██╔╝  
+# ██║  ██║███████╗██║  ██║   ██║   
+# ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝   
 
-if [ ! -d ".venv" ]; then
-    echo_red "❌ 错误: 虚拟环境不存在"
-    exit 1
-fi
+restart_service() {
+    log_header "执行重启操作"
+    
+    # 清理进程
+    pkill -f "run_rl_swarm.sh" || true
+    screen -S rl_train -X quit || true
+    
+    # 清理GPU缓存
+    python -c "import torch; torch.mps.empty_cache()" 2>/dev/null || true
+    
+    # 等待资源释放
+    sleep 5
+    
+    # 重新启动
+    init_m4_environment
+    start_training
+}
 
-echo_blue "🎮 使用命令:"
-echo_blue "   启动: ./m4.sh"
-echo_blue "   停止: Ctrl+C"
-echo_blue "   日志: tail -f m4_monitor.log"
-echo ""
-echo_blue "💡 优化特性:"
-echo_blue "   • 自动硬件检测"
-echo_blue "   • 动态模型选择"
-echo_blue "   • GPU加速支持"
+# ██╗      ██████╗  ██████╗ █████╗ 
+# ██║     ██╔═══██╗██╔════╝██╔══██╗
+# ██║     ██║   ██║██║     ███████║
+# ██║     ██║   ██║██║     ██╔══██║
+# ███████╗╚██████╔╝╚██████╗██║  ██║
+# ╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝
 
-# 启动主程序
-main
+main_loop() {
+    while true; do
+        start_training
+        
+        if ! monitor_training; then
+            log_warning "训练异常，10秒后重启..."
+            sleep 10
+            restart_service
+        fi
+        
+        sleep 5
+    done
+}
+
+# ██████╗ ███████╗███╗   ██╗██████╗ ███████╗██████╗ 
+# ██╔══██╗██╔════╝████╗  ██║██╔══██╗██╔════╝██╔══██╗
+# ██████╔╝█████╗  ██╔██╗ ██║██║  ██║█████╗  ██████╔╝
+# ██╔══██╗██╔══╝  ██║╚██╗██║██║  ██║██╔══╝  ██╔══██╗
+# ██║  ██║███████╗██║ ╚████║██████╔╝███████╗██║  ██║
+# ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═════╝ ╚══════╝╚═╝  ╚═╝
+
+case "${1:-}" in
+    --start)
+        init_m4_environment
+        main_loop
+        ;;
+    --stop)
+        pkill -f "run_rl_swarm.sh"
+        screen -S rl_train -X quit
+        log_success "已停止所有服务"
+        ;;
+    --status)
+        echo -e "${BOLD}${CYAN}RL Swarm 服务状态${RESET}"
+        echo "--------------------------------"
+        screen -list | grep "rl_train" || echo "训练会话: 未运行"
+        pgrep -fl "run_rl_swarm.sh" || echo "训练进程: 未运行"
+        echo "--------------------------------"
+        python -c "import torch; print(f'PyTorch 后端: {torch.backends.mps.is_available() and \"Metal\" or \"CPU\"}')"
+        ;;
+    --clean)
+        rm -rf "${M4_CONFIG[CACHE_DIR]}"
+        python -c "import torch; torch.mps.empty_cache()"
+        log_success "已清理所有缓存"
+        ;;
+    *)
+        echo -e "${BOLD}Usage:${RESET}"
+        echo "  $0 --start   启动训练服务"
+        echo "  $0 --stop    停止服务"
+        echo "  $0 --status  查看状态"
+        echo "  $0 --clean   清理缓存"
+        exit 1
+        ;;
+esac
